@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebRTC Video Streaming</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      background: #f4f4f4;
+    }
+    .app {
+      max-width: 900px;
+      margin: auto;
+      padding: 20px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .status-indicator {
+      display: flex;
+      align-items: center;
+    }
+    .status-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      margin-right: 8px;
+    }
+    .video-container {
+      margin-top: 20px;
+      background: black;
+      height: 360px;
+    }
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .controls {
+      margin-top: 20px;
+    }
+    button {
+      padding: 10px 15px;
+      margin-right: 10px;
+    }
+    .info-panel {
+      margin-top: 20px;
+      background: #fff;
+      padding: 10px;
+      border: 1px solid #ccc;
+    }
+    .info-item {
+      margin-bottom: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="header">
+      <h1>WebRTC Video Streaming</h1>
+      <div class="status-indicator">
+        <div class="status-dot" id="statusDot"></div>
+        <span id="statusText">Disconnected</span>
+      </div>
+    </div>
+
+    <div class="video-container">
+      <video id="remoteVideo" autoplay playsinline muted></video>
+    </div>
+
+    <div class="controls">
+      <button id="startBtn">Start Video Stream</button>
+      <button id="stopBtn" disabled>Stop Stream</button>
+      <button id="toggleVideoBtn" disabled>🎥 Hide Video</button>
+      <button id="toggleAudioBtn" disabled>🔊 Mute Audio</button>
+    </div>
+
+    <div class="info-panel">
+      <div class="info-item"><strong>Robot Status:</strong> <span id="robotStatus">Not Connected</span></div>
+      <div class="info-item"><strong>WebRTC State:</strong> <span id="connectionState">new</span></div>
+      <div class="info-item"><strong>Video:</strong> <span id="videoState">Enabled</span></div>
+      <div class="info-item"><strong>Audio:</strong> <span id="audioState">Enabled</span></div>
+    </div>
+  </div>
+
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script>
+    const SIGNAL_URL = "http://localhost:9010";
+    const socket = io(SIGNAL_URL);
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: ["stun:139.59.66.172:3478"] },
+        {
+          urls: ["turn:139.59.66.172:3478"],
+          username: "robotcoturn",
+          credential: "robot@123",
+        },
+      ],
+    });
+
+    let dataChannel;
+    const video = document.getElementById("remoteVideo");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const toggleVideoBtn = document.getElementById("toggleVideoBtn");
+    const toggleAudioBtn = document.getElementById("toggleAudioBtn");
+    const statusText = document.getElementById("statusText");
+    const statusDot = document.getElementById("statusDot");
+    const robotStatus = document.getElementById("robotStatus");
+    const connectionStateText = document.getElementById("connectionState");
+    const videoState = document.getElementById("videoState");
+    const audioState = document.getElementById("audioState");
+
+    let isConnected = false;
+    let isVideoEnabled = true;
+    let isAudioEnabled = true;
+    let robotReady = false;
+
+    socket.on("connect", () => {
+      statusText.textContent = "Connected to signaling server";
+      statusDot.style.backgroundColor = "orange";
+    });
+
+    socket.on("robot-ready", () => {
+      robotReady = true;
+      robotStatus.textContent = "Ready";
+      statusText.textContent = "Robot ready - Click Start";
+    });
+
+    socket.on("robot-disconnected", () => {
+      robotReady = false;
+      robotStatus.textContent = "Not Connected";
+      statusText.textContent = "Robot disconnected";
+      video.srcObject = null;
+      updateButtons();
+    });
+
+    socket.on("answer", async (data) => {
+      await pc.setRemoteDescription(new RTCSessionDescription(data));
+    });
+
+    socket.on("candidate", async (data) => {
+      await pc.addIceCandidate(new RTCIceCandidate(data));
+    });
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        socket.emit("candidate", event.candidate);
+      }
+    };
+
+    pc.ontrack = (event) => {
+      video.srcObject = event.streams[0];
+    };
+
+    pc.onconnectionstatechange = () => {
+      const state = pc.connectionState;
+      connectionStateText.textContent = state;
+      statusDot.style.backgroundColor =
+        state === "connected" ? "green" : state === "connecting" ? "orange" : "red";
+    };
+
+    startBtn.onclick = async () => {
+      if (!robotReady) return alert("Robot not ready");
+
+      dataChannel = pc.createDataChannel("control");
+      dataChannel.onopen = () => {
+        isConnected = true;
+        updateButtons();
+      };
+
+      const offer = await pc.createOffer({ offerToReceiveVideo: true });
+      await pc.setLocalDescription(offer);
+      socket.emit("offer", offer);
+    };
+
+    stopBtn.onclick = () => {
+      pc.close();
+      video.srcObject = null;
+      location.reload();
+    };
+
+    toggleVideoBtn.onclick = () => {
+      if (!dataChannel || dataChannel.readyState !== "open") return;
+      isVideoEnabled = !isVideoEnabled;
+      video.style.display = isVideoEnabled ? "block" : "none";
+      dataChannel.send(isVideoEnabled ? "start-video" : "stop-video");
+      videoState.textContent = isVideoEnabled ? "Enabled" : "Disabled";
+      toggleVideoBtn.textContent = isVideoEnabled ? "🎥 Hide Video" : "🎥 Show Video";
+    };
+
+    toggleAudioBtn.onclick = () => {
+      isAudioEnabled = !isAudioEnabled;
+      video.muted = !isAudioEnabled;
+      audioState.textContent = isAudioEnabled ? "Enabled" : "Muted";
+      toggleAudioBtn.textContent = isAudioEnabled ? "🔊 Mute Audio" : "🔇 Unmute Audio";
+    };
+
+    function updateButtons() {
+      startBtn.disabled = isConnected || !robotReady;
+      stopBtn.disabled = !isConnected;
+      toggleVideoBtn.disabled = !isConnected;
+      toggleAudioBtn.disabled = !isConnected;
+    }
+  </script>
+</body>
+</html>
