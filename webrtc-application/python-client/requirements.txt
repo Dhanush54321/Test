@@ -1,0 +1,4 @@
+aiortc
+opencv-python
+av
+websockets
