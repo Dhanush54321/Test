@@ -7,8 +7,7 @@ from aiortc.contrib.signaling import BYE
 from av import VideoFrame
 import threading
 import time
-# from config import SIGNALING_SERVER_URL, VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS, CAMERA_INDEX
-
+from config import VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS
 sio = socketio.AsyncClient()
 pc = None
 dc = None
@@ -17,10 +16,12 @@ video_track = None
 class WebcamVideoTrack(VideoStreamTrack):
     def __init__(self):
         super().__init__()
-        self.cap = cv2.VideoCapture(CAMERA_INDEX)  
+        self.cap = cv2.VideoCapture("/home/dhanush/Downloads/Testing/webrtc-application/web-client/videoplayback.mp4")  
+        # self.cap = cv2.VideoCapture(CAMERA_INDEX)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, VIDEO_WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, VIDEO_HEIGHT)
         self.cap.set(cv2.CAP_PROP_FPS, VIDEO_FPS)
+        
         
         if not self.cap.isOpened():
             raise RuntimeError("Could not open webcam")
@@ -194,7 +195,7 @@ async def cleanup():
 async def main():
     try:
         print("[Backend] Starting robot application...")
-        await sio.connect("http://localhost:9010")
+        await sio.connect("https://test-e0et.onrender.com")
         print("[Backend] Connected to signaling server, waiting for connections...")
         await sio.wait()
     except KeyboardInterrupt:
