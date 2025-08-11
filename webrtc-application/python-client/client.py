@@ -18,10 +18,9 @@ video_track = None
 class WebcamVideoTrack(VideoStreamTrack):
     def __init__(self,camera_index):
 
-        
         self.camera_index = camera_index
         # self.cap = cv2.VideoCapture("/home/dhanush/Downloads/Testing/webrtc-application/web-client/videoplayback.mp4")  
-        self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_V4L2)
+        self.cap = cv2.VideoCapture(self.camera_index)
         print(self.cap.isOpened())
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, VIDEO_WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, VIDEO_HEIGHT)
@@ -38,8 +37,6 @@ class WebcamVideoTrack(VideoStreamTrack):
         
         print(f"[Backend] Webcam initialized: {VIDEO_WIDTH}x{VIDEO_HEIGHT} @ {VIDEO_FPS}fps")
 
-        
-    
     async def recv(self):
         pts, time_base = await self.next_timestamp()
         
@@ -73,6 +70,10 @@ async def connect():
 async def offer(data):
     global pc, dc, video_track
     print("[Backend] Offer received:", data)
+
+    if pc:
+        print("[Backend] Existing peer connection found, closing it")
+        await cleanup()
 
     ice_servers = [
         RTCIceServer(urls=["stun:139.59.66.172:3478"]),
@@ -150,9 +151,9 @@ async def offer(data):
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
         print(f"[Backend] Connection state changed: {pc.connectionState}")
-        if pc.connectionState == "failed":
-            print("[Backend] Connection failed, cleaning up...")
-            await cleanup()
+        # if pc.connectionState == "failed":
+        #     print("[Backend] Connection failed, cleaning up...")
+        #     await cleanup()
 
     @pc.on("iceconnectionstatechange")
     async def on_iceconnectionstatechange():
@@ -192,6 +193,11 @@ async def candidate(data):
 @sio.event
 async def disconnect():
     print("[Backend] Disconnected from signaling server")
+    await cleanup()
+
+@sio.event
+async def robot_disconnect():
+    print("[Backend] Robot disconnected from signaling server")
     await cleanup()
 
 async def cleanup():
