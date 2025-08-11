@@ -2,22 +2,27 @@ import socketio
 import asyncio
 import cv2
 import numpy as np
+import uuid
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, VideoStreamTrack, RTCConfiguration, RTCIceServer
 from aiortc.contrib.signaling import BYE
+from aiortc.sdp import candidate_from_sdp
 from av import VideoFrame
 import threading
 import time
-from config import VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS
+from config import VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS, CAMERA_INDEX
 sio = socketio.AsyncClient()
 pc = None
 dc = None
 video_track = None
 
 class WebcamVideoTrack(VideoStreamTrack):
-    def __init__(self):
-        super().__init__()
-        self.cap = cv2.VideoCapture("/home/dhanush/Downloads/Testing/webrtc-application/web-client/videoplayback.mp4")  
-        # self.cap = cv2.VideoCapture(CAMERA_INDEX)
+    def __init__(self,camera_index):
+
+        
+        self.camera_index = camera_index
+        # self.cap = cv2.VideoCapture("/home/dhanush/Downloads/Testing/webrtc-application/web-client/videoplayback.mp4")  
+        self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_V4L2)
+        print(self.cap.isOpened())
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, VIDEO_WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, VIDEO_HEIGHT)
         self.cap.set(cv2.CAP_PROP_FPS, VIDEO_FPS)
@@ -26,7 +31,14 @@ class WebcamVideoTrack(VideoStreamTrack):
         if not self.cap.isOpened():
             raise RuntimeError("Could not open webcam")
         
+        self._id = str(uuid.uuid4())  # Unique ID for track
+        self.kind = "video" 
+        self._readyState = "live"                  # aiortc expects this
+        self._MediaStreamTrack__ended = False 
+        
         print(f"[Backend] Webcam initialized: {VIDEO_WIDTH}x{VIDEO_HEIGHT} @ {VIDEO_FPS}fps")
+
+        
     
     async def recv(self):
         pts, time_base = await self.next_timestamp()
@@ -37,10 +49,12 @@ class WebcamVideoTrack(VideoStreamTrack):
             return None
         
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        print(frame)
         
         av_frame = VideoFrame.from_ndarray(frame, format="rgb24")
         av_frame.pts = pts
         av_frame.time_base = time_base
+        print("frame captured")
         
         return av_frame
     
@@ -92,12 +106,11 @@ async def offer(data):
 
     # Initialize webcam video track
     try:
-        video_track = WebcamVideoTrack()
+        video_track = WebcamVideoTrack(CAMERA_INDEX)
         pc.addTrack(video_track)
         print("[Backend] Video track added to peer connection")
     except Exception as e:
         print(f"[Backend] Failed to initialize webcam: {e}")
-        # Continue without video track - connection can still be established
         video_track = None
 
     @pc.on("datachannel")
@@ -166,13 +179,13 @@ async def candidate(data):
     print("[Backend] ICE candidate received:", data)
     if pc:
         try:
-            candidate = RTCIceCandidate(
-                candidate=data["candidate"],
-                sdpMid=data["sdpMid"],
-                sdpMLineIndex=data["sdpMLineIndex"]
-            )
-            await pc.addIceCandidate(candidate)
+            parsed = candidate_from_sdp(data["candidate"])
+            parsed.sdpMid = data["sdpMid"]
+            parsed.sdpMLineIndex = data["sdpMLineIndex"]
+
+            await pc.addIceCandidate(parsed)
             print("[Backend] ICE candidate added successfully")
+
         except Exception as e:
             print(f"[Backend] Failed to add ICE candidate: {e}")
 

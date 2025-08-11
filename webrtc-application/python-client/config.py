@@ -10,6 +10,6 @@ import os
 VIDEO_WIDTH = 640
 VIDEO_HEIGHT = 480
 VIDEO_FPS = 30
-CAMERA_INDEX = 0
+CAMERA_INDEX = 2
 # print(f"[Config] Environment: {ENVIRONMENT}")
 # print(f"[Config] Signaling Server: {SIGNALING_SERVER_URL}")
