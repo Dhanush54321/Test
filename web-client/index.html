@@ -1,8 +1,9 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
+
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>WebRTC Video Streaming</title>
   <style>
     body {
@@ -11,54 +12,76 @@
       padding: 0;
       background: #f4f4f4;
     }
+
     .app {
       max-width: 900px;
       margin: auto;
       padding: 20px;
     }
+
     .header {
       display: flex;
       align-items: center;
       justify-content: space-between;
     }
+
     .status-indicator {
       display: flex;
       align-items: center;
     }
+
     .status-dot {
       width: 12px;
       height: 12px;
       border-radius: 50%;
       margin-right: 8px;
+      background: grey;
     }
+
     .video-container {
       margin-top: 20px;
       background: black;
       height: 360px;
     }
+
     video {
       width: 100%;
       height: 100%;
       object-fit: cover;
+      background: black;
     }
+
     .controls {
       margin-top: 20px;
     }
+
     button {
       padding: 10px 15px;
       margin-right: 10px;
     }
+
     .info-panel {
       margin-top: 20px;
       background: #fff;
       padding: 10px;
       border: 1px solid #ccc;
     }
+
     .info-item {
       margin-bottom: 8px;
     }
+
+    pre.log {
+      max-height: 160px;
+      overflow: auto;
+      background: #111;
+      color: #0f0;
+      padding: 8px;
+      font-size: 12px;
+    }
   </style>
 </head>
+
 <body>
   <div class="app">
     <div class="header">
@@ -86,24 +109,28 @@
       <div class="info-item"><strong>Video:</strong> <span id="videoState">Enabled</span></div>
       <div class="info-item"><strong>Audio:</strong> <span id="audioState">Enabled</span></div>
     </div>
+
+    <h3>Debug log</h3>
+    <pre class="log" id="log"></pre>
   </div>
 
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <script>
-    const SIGNAL_URL = "https://test-e0et.onrender.com";
-    const socket = io(SIGNAL_URL);
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: ["stun:139.59.66.172:3478"] },
-        {
-          urls: ["turn:139.59.66.172:3478"],
-          username: "robotcoturn",
-          credential: "robot@123",
-        },
-      ],
-    });
+    // ----- CONFIG -----
+    const SIGNAL_URL = "https://test-e0et.onrender.com"; // change to your signaling server
+    const ICE_SERVERS = [
+      { urls: ["stun:139.59.66.172:3478"] },
+      {
+        urls: ["turn:139.59.66.172:3478"],
+        username: "robotcoturn",
+        credential: "robot@123",
+      },
+    ];
+    // ------------------
 
-    let dataChannel;
+    const socket = io(SIGNAL_URL);
+
+    // UI elements
     const video = document.getElementById("remoteVideo");
     const startBtn = document.getElementById("startBtn");
     const stopBtn = document.getElementById("stopBtn");
@@ -115,98 +142,218 @@
     const connectionStateText = document.getElementById("connectionState");
     const videoState = document.getElementById("videoState");
     const audioState = document.getElementById("audioState");
+    const logEl = document.getElementById("log");
 
+    // runtime state
+    let pc = null;
+    let dataChannel = null;
     let isConnected = false;
-    let isVideoEnabled = true;
-    let isAudioEnabled = true;
+    let isVideoEnabled = true;   // logical (robot camera on/off)
+    let isAudioEnabled = true;   // local playback mute/unmute
     let robotReady = false;
 
+    // logging helper
+    function log(...args) {
+      console.log(...args);
+      logEl.textContent += args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ') + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    // ---- Signaling events ----
     socket.on("connect", () => {
+      log("[Signaling] connected");
       statusText.textContent = "Connected to signaling server";
       statusDot.style.backgroundColor = "orange";
+      socket.emit("register-viewer");
+      socket.emit("check-robot");
     });
 
+    socket.on("robot-status", (data) => {
+        if (data.connected) {
+          robotReady = true;
+          robotStatus.textContent = "Ready";
+          statusText.textContent = "Robot ready - Click Start";
+          console.log("[Signaling] Robot already online");
+        } else {
+          robotReady = false;
+          robotStatus.textContent = "Not Connected";
+          statusText.textContent = "Waiting for robot...";
+          console.log("[Signaling] No robot yet, waiting...");
+        }
+        updateButtons();
+      });
     socket.on("robot-ready", () => {
       robotReady = true;
       robotStatus.textContent = "Ready";
       statusText.textContent = "Robot ready - Click Start";
+      log("[Signaling] robot ready");
+      updateButtons();
     });
 
     socket.on("robot-disconnected", () => {
       robotReady = false;
       robotStatus.textContent = "Not Connected";
       statusText.textContent = "Robot disconnected";
-      video.srcObject = null;
+      log("[Signaling] robot disconnected");
+      // keep peer alive if you want; we clear UI stream
+      if (video) video.srcObject = null;
       updateButtons();
     });
 
     socket.on("answer", async (data) => {
-      await pc.setRemoteDescription(new RTCSessionDescription(data));
+      log("[Signaling] answer received");
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(data));
+      } catch (e) {
+        log("[Error] setRemoteDescription(answer) failed:", e);
+      }
     });
 
     socket.on("candidate", async (data) => {
-      await pc.addIceCandidate(new RTCIceCandidate(data));
+      log("[Signaling] remote candidate", data);
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(data));
+      } catch (e) {
+        log("[Error] addIceCandidate failed:", e);
+      }
     });
 
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        socket.emit("candidate", event.candidate);
+    // ---- WebRTC lifecycle ----
+    function createPeerConnection() {
+      const _pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+      _pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          socket.emit("candidate", event.candidate);
+          log("[Local] sent candidate");
+        }
+      };
+
+      _pc.ontrack = (event) => {
+        log("[PC] ontrack received - attach stream");
+        video.srcObject = event.streams[0];
+      };
+
+      _pc.onconnectionstatechange = () => {
+        const state = _pc.connectionState;
+        connectionStateText.textContent = state;
+        statusDot.style.backgroundColor = (state === "connected") ? "green" : (state === "connecting") ? "orange" : "red";
+        if (state === "connected") {
+          isConnected = true;
+          updateButtons();
+        } else if (state === "disconnected" || state === "closed" || state === "failed") {
+          isConnected = false;
+          updateButtons();
+        }
+      };
+
+      return _pc;
+    }
+
+    async function startStream() {
+      if (!robotReady) {
+        return alert("Robot not ready");
       }
-    };
 
-    pc.ontrack = (event) => {
-      video.srcObject = event.streams[0];
-    };
+      // create new RTCPeerConnection (fresh)
+      pc = createPeerConnection();
 
-    pc.onconnectionstatechange = () => {
-      const state = pc.connectionState;
-      connectionStateText.textContent = state;
-      statusDot.style.backgroundColor =
-        state === "connected" ? "green" : state === "connecting" ? "orange" : "red";
-    };
-
-    startBtn.onclick = async () => {
-      if (!robotReady) return alert("Robot not ready");
-
+      // create data channel for control
       dataChannel = pc.createDataChannel("control");
       dataChannel.onopen = () => {
+        log("[DC] datachannel open");
         isConnected = true;
         updateButtons();
       };
+      dataChannel.onmessage = (evt) => {
+        log("[DC] msg:", evt.data);
+      };
+      dataChannel.onclose = () => {
+        log("[DC] closed");
+      };
 
-      const offer = await pc.createOffer({ offerToReceiveVideo: true });
-      await pc.setLocalDescription(offer);
-      socket.emit("offer", offer);
-    };
+      // create offer
+      try {
+        const offer = await pc.createOffer({ offerToReceiveVideo: true });
+        await pc.setLocalDescription(offer);
+        // send offer to server (server forwards to robot)
+        socket.emit("offer", { sdp: pc.localDescription.sdp, type: pc.localDescription.type });
+        log("[Signaling] offer sent");
+      } catch (e) {
+        log("[Error] createOffer failed:", e);
+      }
 
-    stopBtn.onclick = () => {
-      pc.close();
+      // UI
+      startBtn.disabled = true;
+      toggleVideoBtn.disabled = true; // will enable when DC opens
+      stopBtn.disabled = true;
+      statusText.textContent = "Waiting for robot answer...";
+    }
+
+    function fullStop() {
+      if (pc) {
+        try { pc.close(); } catch (e) { }
+        pc = null;
+        dataChannel = null;
+      }
       video.srcObject = null;
-      location.reload();
-    };
+      isConnected = false;
+      isVideoEnabled = true;
+      statusText.textContent = "Disconnected";
+      statusDot.style.backgroundColor = "grey";
+      updateButtons();
+      log("[Local] full stop / closed pc");
+      // reload optional:
+      // location.reload();
+    }
 
-    toggleVideoBtn.onclick = () => {
-      if (!dataChannel || dataChannel.readyState !== "open") return;
+    // Toggle camera on robot (only sends command via data channel)
+    function toggleCamera() {
+      if (!dataChannel || dataChannel.readyState !== "open") {
+        return alert("Control channel not open");
+      }
+      // flip desired state
       isVideoEnabled = !isVideoEnabled;
-      video.style.display = isVideoEnabled ? "block" : "none";
-      dataChannel.send(isVideoEnabled ? "start-video" : "stop-video");
-      videoState.textContent = isVideoEnabled ? "Enabled" : "Disabled";
-      toggleVideoBtn.textContent = isVideoEnabled ? "🎥 Hide Video" : "🎥 Show Video";
-    };
+      // send commands matching robot (robot.py expects 'start-camera' / 'stop-camera')
+      const cmd = isVideoEnabled ? "start-camera" : "stop-camera";
+      dataChannel.send(cmd);
+      log("[DC] sent", cmd);
 
-    toggleAudioBtn.onclick = () => {
+      // update UI
+      videoState.textContent = isVideoEnabled ? "Enabled" : "Disabled";
+      toggleVideoBtn.textContent = isVideoEnabled ? "🎥 Turn Off Camera" : "🎥 Turn On Camera";
+      statusText.textContent = isVideoEnabled ? "Camera enabled" : "Camera disabled";
+      // Do not hide video element — server will send black frames when camera stopped.
+      // optionally hide it:
+      // video.style.display = isVideoEnabled ? "block" : "none";
+    }
+
+    // local mute/unmute playback
+    function toggleAudio() {
       isAudioEnabled = !isAudioEnabled;
       video.muted = !isAudioEnabled;
       audioState.textContent = isAudioEnabled ? "Enabled" : "Muted";
       toggleAudioBtn.textContent = isAudioEnabled ? "🔊 Mute Audio" : "🔇 Unmute Audio";
-    };
+    }
 
+    // UI state update
     function updateButtons() {
       startBtn.disabled = isConnected || !robotReady;
       stopBtn.disabled = !isConnected;
       toggleVideoBtn.disabled = !isConnected;
       toggleAudioBtn.disabled = !isConnected;
     }
+
+    // ---- button handlers ----
+    startBtn.onclick = startStream;
+    stopBtn.onclick = fullStop;
+    toggleVideoBtn.onclick = toggleCamera;
+    toggleAudioBtn.onclick = toggleAudio;
+
+    // initial UI
+    updateButtons();
+    log("viewer ready");
   </script>
 </body>
+
 </html>
