@@ -1,269 +1,309 @@
-# robot.py
+import socketio
 import asyncio
-import uuid
 import cv2
 import numpy as np
-import socketio
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer, VideoStreamTrack
+import uuid
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, VideoStreamTrack, RTCConfiguration, RTCIceServer
+from aiortc.contrib.signaling import BYE
+from aiortc.sdp import candidate_from_sdp
 from av import VideoFrame
-from config import SIGNALING_SERVER_URL, CAMERA_INDEX, VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS
-
+import threading
+import time
+from config import VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS, CAMERA_INDEX, SIGNALING_SERVER_URL
 sio = socketio.AsyncClient()
 pc = None
 dc = None
 video_track = None
-current_viewer_id = None
 
 class WebcamVideoTrack(VideoStreamTrack):
     def __init__(self, camera_index):
-        super().__init__()  # don't forget base init
         self.camera_index = camera_index
         self.cap = cv2.VideoCapture(self.camera_index)
+        print(self.cap.isOpened())
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, VIDEO_WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, VIDEO_HEIGHT)
         self.cap.set(cv2.CAP_PROP_FPS, VIDEO_FPS)
+        
         if not self.cap.isOpened():
             raise RuntimeError("Could not open webcam")
-        self._enabled = True
-        print("[Robot] Webcam initialized")
+        
+        self._id = str(uuid.uuid4())  
+        self.kind = "video" 
+        self._readyState = "live"                 
+        self._MediaStreamTrack__ended = False 
+        self._enabled = True  
+        
+        print(f"[Backend] Webcam initialized: {VIDEO_WIDTH}x{VIDEO_HEIGHT} @ {VIDEO_FPS}fps")
 
     async def recv(self):
         pts, time_base = await self.next_timestamp()
-
+        
         if not self._enabled:
-            black = np.zeros((VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=np.uint8)
-            frame = VideoFrame.from_ndarray(black, format="rgb24")
-            frame.pts = pts
-            frame.time_base = time_base
-            return frame
-
+            
+            black_frame = np.zeros((VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=np.uint8)
+            av_frame = VideoFrame.from_ndarray(black_frame, format="rgb24")
+            av_frame.pts = pts
+            av_frame.time_base = time_base
+            return av_frame
+        
         ret, frame = self.cap.read()
         if not ret:
-            black = np.zeros((VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=np.uint8)
-            frame = VideoFrame.from_ndarray(black, format="rgb24")
-            frame.pts = pts
-            frame.time_base = time_base
-            return frame
-
+            print("[Backend] Failed to capture frame")
+            black_frame = np.zeros((VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=np.uint8)
+            av_frame = VideoFrame.from_ndarray(black_frame, format="rgb24")
+            av_frame.pts = pts
+            av_frame.time_base = time_base
+            return av_frame
+        
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        avf = VideoFrame.from_ndarray(frame, format="rgb24")
-        avf.pts = pts
-        avf.time_base = time_base
-        return avf
-
-    def enable(self):
+        print(frame)
+        
+        av_frame = VideoFrame.from_ndarray(frame, format="rgb24")
+        av_frame.pts = pts
+        av_frame.time_base = time_base
+        print("frame captured")
+        
+        return av_frame
+    
+    def enable_video(self):
+        """Enable video streaming"""
         self._enabled = True
-        print("[Robot] Video enabled")
-
-    def disable(self):
+        print("[Backend] Video streaming enabled")
+    
+    def disable_video(self):
+        """Disable video streaming (sends black frames)"""
         self._enabled = False
-        print("[Robot] Video disabled")
-
+        print("[Backend] Video streaming disabled")
+    
     def stop(self):
         if self.cap:
             self.cap.release()
-            print("[Robot] Webcam released")
+            print("[Backend] Webcam released")
 
+
+async def start_video_track():
+    global video_track,pc
+    
+    if not pc:
+        print("[Backend] No active peer connection to start available")
+        return
+    
+    if video_track:
+        print("[Backend] Video track already started")
+        return  
+    try:
+        video_track = WebcamVideoTrack(CAMERA_INDEX)
+        for sender in pc.getSenders():
+            if sender.track is None and sender.kind == "video":
+                await sender.replace_track(video_track)
+                break
+        print("[Backend] Video streaming enabled")
+    
+    except Exception as e:
+        print(f"[Backend] Failed to enable video: {e}")
+
+async def stop_video_track():
+    global video_track,pc
+
+    if not pc:
+        print("[Backend] No active peer connection to stop video")
+        return
+    
+    if not video_track:
+        print("[Backend] No video track available")
+        return
+        
+    try:
+        for sender in pc.getSenders():
+            if sender.track == video_track:
+                await sender.replace_track(None)
+                break
+        video_track.stop()
+        video_track = None
+        print("[Backend] Video streaming disabled (track removed, connection alive)")
+    except Exception as e:
+        print(f"[Backend]  Failed to disable video: {e}")
 
 @sio.event
 async def connect():
-    print("[Robot] connected to signaling server")
+    print("[Backend] Connected to signaling server")
     await sio.emit("register-robot")
-
-
-@sio.event
-async def registered_as_robot():
-    print("[Robot] Registered as robot on server")
-
+    print("[Backend] Robot registered - waiting for frontend pairing...")
 
 @sio.event
-async def viewer_waiting():
-    print("[Robot] A viewer is waiting (server notified)")
+async def robot_accepted():
+    print("[Backend] Robot registration accepted")
+
+@sio.event 
+async def frontend_ready():
+    print("[Backend] Frontend paired - initializing WebRTC...")
 
 
 @sio.event
 async def offer(data):
-    """
-    data: { sdp, type, from }
-    'from' is viewer socket id so we can send answer back
-    """
-    global pc, dc, video_track, current_viewer_id
+    global pc, dc, video_track
+    print("[Backend] Offer received:", data)
 
-    print("[Robot] Offer received from viewer")
-    current_viewer_id = data.get("from")
-
-    # if existing pc, clean it up (full close) then recreate
     if pc:
-        await cleanup(full=True)
+        print("[Backend] Existing peer connection found, closing it")
+        await cleanup()
 
     ice_servers = [
-        RTCIceServer(urls=["stun:stun.l.google.com:19302"])
+        RTCIceServer(urls=["stun:139.59.66.172:3478"]),
+        # RTCIceServer(urls=["stun:stun1.l.google.com:19302"]),
+        # RTCIceServer(urls=["stun:stun2.l.google.com:19302"]),
+        
+        # RTCIceServer(urls=["stun:bn-turn1.xirsys.com"]),
+        
+      
+        # RTCIceServer(
+        #     urls=[
+        #         "turn:bn-turn1.xirsys.com:80?transport=udp",
+        #         "turn:bn-turn1.xirsys.com:80?transport=tcp",
+        #         "turns:bn-turn1.xirsys.com:443?transport=tcp"
+        #     ],
+        #     username="Jc0EzhdGBYiCzaKjrC1P7o2mcXTo6TlM_E9wjvXn16Eqs7ntsZaGMeRVAxM4m31rAAAAAGhTqu5CYXJhdGg=",
+        #     credential="c0f43e62-4cd4-11f0-aba7-0242ac140004"
+        # ),
+        
+        
+        RTCIceServer(
+            urls=["turn:139.59.66.172:3478"],
+            username="robotcoturn",
+            credential="robot@123"
+        )
     ]
+
     configuration = RTCConfiguration(iceServers=ice_servers)
     pc = RTCPeerConnection(configuration)
 
-    # Create video sender by adding a track (attempt to create webcam initially)
     try:
         video_track = WebcamVideoTrack(CAMERA_INDEX)
-        video_sender = pc.addTrack(video_track)
-        print("[Robot] Added initial video track to peer")
+        pc.addTrack(video_track)
+        print("[Backend] Video track added to peer connection")
     except Exception as e:
-        print("[Robot] Could not open webcam initially:", e)
+        print(f"[Backend] Failed to initialize webcam: {e}")
         video_track = None
 
     @pc.on("datachannel")
     def on_datachannel(channel):
         global dc
         dc = channel
-        print("[Robot] DataChannel opened:", channel.label)
+        print("[Backend] Data channel opened:", channel.label)
 
         @channel.on("message")
-        def on_message(msg):
-            print("[Robot] Received datachannel message:", msg)
-            # viewer commands
-            if msg == "start-camera":
-                asyncio.create_task(handle_start_camera())
-                channel.send("camera-started-ack")
-            elif msg == "stop-camera":
-                asyncio.create_task(handle_stop_camera())
-                channel.send("camera-stopped-ack")
+        def on_message(message):
+            print(f"[Backend] Received message from frontend: {message}")
+            
+            if message == "start-video":
+                print("[Backend] Video streaming requested")
+                asyncio.create_task(start_video_track())
+                response = "Video streaming started"
+            elif message == "stop-video":
+                print("[Backend] Video streaming stop requested")
+                asyncio.create_task(stop_video_track())
+                response = "Video streaming stopped"
             else:
-                channel.send(f"echo:{msg}")
+                response = f"Ack: {message}"
+            
+            print(f"[Backend] Sending response: {response}")
+            channel.send(response)
 
     @pc.on("icecandidate")
     async def on_icecandidate(candidate):
         if candidate:
-            # send candidate to viewer
-            await sio.emit("candidate", {"to": current_viewer_id, "candidate": {
+            print(f"[Backend] Sending ICE candidate: {candidate.candidate[:50]}...")
+            await sio.emit("candidate", {
                 "candidate": candidate.candidate,
                 "sdpMid": candidate.sdpMid,
                 "sdpMLineIndex": candidate.sdpMLineIndex
-            }})
+            })
+        else:
+            print("[Backend] ICE gathering completed")
 
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
-        print("[Robot] PC connectionState:", pc.connectionState)
-        if pc.connectionState in ("failed", "closed"):
-            print("[Robot] PC closed/fail - cleaning up")
-            await cleanup(full=True)
+        print(f"[Backend] Connection state changed: {pc.connectionState}")
+        # if pc.connectionState == "failed":
+        #     print("[Backend] Connection failed, cleaning up...")
+        #     await cleanup()
 
-    # set remote, create answer, send back
+    @pc.on("iceconnectionstatechange")
+    async def on_iceconnectionstatechange():
+        print(f"[Backend] ICE connection state changed: {pc.iceConnectionState}")
+        
+    @pc.on("icegatheringstatechange")
+    async def on_icegatheringstatechange():
+        print(f"[Backend] ICE gathering state changed: {pc.iceGatheringState}")
+
+    await sio.emit("robot-ready-for-offers")
+    print("[Backend] Peer connection ready, signaled server")
+
     await pc.setRemoteDescription(RTCSessionDescription(sdp=data["sdp"], type=data["type"]))
+
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
 
-    await sio.emit("answer", {"to": current_viewer_id, "sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
-    print("[Robot] Sent answer to viewer")
-
-    # inform server & viewers robot is ready
+    await sio.emit("answer", {
+        "sdp": pc.localDescription.sdp,
+        "type": pc.localDescription.type
+    })
+    print("[Backend] Sent answer")
+    
     await sio.emit("robot-ready-for-offers")
-
-async def handle_start_camera():
-    global pc, video_track
-    if not pc:
-        print("[Robot] No active pc to start camera")
-        return
-
-    # If a track already exists we may only need to enable it
-    if video_track:
-
-        try:
-            video_track.enable()
-            print("[Robot] Re-enabled existing video track")
-            return
-        except Exception as e:
-            print("[Robot] Failed to re-enable existing track:", e)
-
-    # create a new track and replace any sender's track
-    try:
-        new_track = WebcamVideoTrack(CAMERA_INDEX)
-        for sender in pc.getSenders():
-            if sender.kind == "video":
-                await sender.replace_track(new_track)
-                video_track = new_track
-                print("[Robot] Replaced sender track with new webcam track")
-                return
-
-        # if no video sender found, add a new sender
-        pc.addTrack(new_track)
-        video_track = new_track
-        print("[Robot] Added webcam track as new sender")
-    except Exception as e:
-        print("[Robot] Failed to start camera:", e)
-
-async def handle_stop_camera():
-    global pc, video_track
-    if not pc:
-        print("[Robot] No active pc to stop camera")
-        return
-
-    if not video_track:
-        print("[Robot] No video track to stop")
-        return
-
-    try:
-        # find the sender that has this track and replace with None
-        for sender in pc.getSenders():
-            if sender.track == video_track:
-                await sender.replace_track(None)
-                break
-        # release camera resources locally
-        video_track.stop()
-        video_track = None
-        print("[Robot] Camera stopped and track removed (PC still alive)")
-    except Exception as e:
-        print("[Robot] Failed to stop camera:", e)
-
+    print("[Backend]  Robot ready for additional offers")
 
 @sio.event
 async def candidate(data):
-    # incoming candidate from viewer
     global pc
-    try:
-        # aiortc wants dict form passed to addIceCandidate, but python-socketio sends separately;
-        # we just create candidate object by using addIceCandidate with dict.
-        candidate = data
-        if pc:
-            await pc.addIceCandidate(candidate)
-            print("[Robot] Added ICE candidate from viewer")
-    except Exception as e:
-        print(" ")
+    print("[Backend] ICE candidate received:", data)
+    if pc:
+        try:
+            parsed = candidate_from_sdp(data["candidate"])
+            parsed.sdpMid = data["sdpMid"]
+            parsed.sdpMLineIndex = data["sdpMLineIndex"]
 
-        
+            await pc.addIceCandidate(parsed)
+            print("[Backend] ICE candidate added successfully")
 
+        except Exception as e:
+            print(f"[Backend] Failed to add ICE candidate: {e}")
 
 @sio.event
 async def disconnect():
-    print("[Robot] disconnected from server")
-    await cleanup(full=True)
+    print("[Backend] Disconnected from signaling server")
+    await cleanup()
 
+@sio.event
+async def robot_disconnect():
+    print("[Backend] Robot disconnected from signaling server")
+    await cleanup()
 
-async def cleanup(full=True):
-    global pc, video_track, dc, current_viewer_id
+async def cleanup(full = True):
+    global pc, video_track
     if video_track:
-        try:
-            video_track.stop()
-        except Exception:
-            pass
+        video_track.stop()
         video_track = None
-    if full and pc:
-        try:
-            await pc.close()
-        except Exception:
-            pass
+    if pc and full:
+        await pc.close()
         pc = None
-    dc = None
-    current_viewer_id = None
-    print("[Robot] cleanup done (full={})".format(full))
+    print("[Backend] Cleanup completed")
 
 
 async def main():
-    await sio.connect(SIGNALING_SERVER_URL)
-    print("[Robot] connected to", SIGNALING_SERVER_URL)
-    await sio.wait()
+    try:
+        print("[Backend] Starting robot application...")
+        print(f"[Backend] Connecting to: {SIGNALING_SERVER_URL}")
+        await sio.connect(SIGNALING_SERVER_URL)
+        print("[Backend] Connected to signaling server, waiting for connections...")
+        await sio.wait()
+    except KeyboardInterrupt:
+        print("[Backend] Shutting down...")
+        await cleanup()
+    except Exception as e:
+        print(f"[Backend] Error: {e}")
+        await cleanup()
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.get_event_loop().run_until_complete(main())
-    except KeyboardInterrupt:
-        print("exiting")
+    asyncio.run(main())
